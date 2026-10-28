@@ -1039,68 +1039,39 @@ local function doLag(c)
         log("Лаг: Storage =", type(storage), "| размер:", type(storage) == "table" and #storage or "-", "| фантом внутри:", present)
     end
 
-    -- менеджер меню беквипов
+    -- менеджер меню беквипов (имена меню в игре: "Beequip Storage", "Beequip Inbox", "Permanent Beequips")
     local okM, mgr = pcall(function() return require(ReplicatedStorage.Gui.BeequipMenus.BeequipMenuManager) end)
     if not okM or type(mgr) ~= "table" then
         log("Лаг: BeequipMenuManager не найден:", tostring(mgr))
         return
     end
-    log("Лаг: менеджер меню, поля:", keysOf(mgr))
     pcall(function() mgr.UpdateAll() end)
-    log("Лаг: UpdateAll выполнен")
 
-    -- ищем меню хранилища (имя угадываем, всё выводим в лог)
-    local menu
-    if type(mgr.GetByName) == "function" then
-        for _, nm in ipairs({"Storage", "BeequipStorage", "Beequips", "Case", "Inbox"}) do
-            local okG, m = pcall(mgr.GetByName, nm)
-            if not (okG and type(m) == "table") then okG, m = pcall(mgr.GetByName, mgr, nm) end
-            log("Лаг: GetByName(" .. nm .. ") =", okG and type(m) or "ошибка")
-            if okG and type(m) == "table" then
-                menu = menu or m
-                log("   поля:", keysOf(m))
-                local mt = getmetatable(m)
-                if mt and type(mt.__index) == "table" then log("   методы класса:", keysOf(mt.__index)) end
-            end
-        end
+    local storageMenu = mgr.GetByName("Beequip Storage") -- обычная функция, не метод
+    if type(storageMenu) ~= "table" then
+        log("Лаг: меню 'Beequip Storage' не найдено, поля менеджера:", keysOf(mgr))
+        return
     end
 
-    -- попытка открыть через методы меню / менеджера
-    local OPEN_FNS = {"Open", "Show", "Toggle", "SetVisible", "SetOpen", "OpenMenu", "ShowMenu"}
-    local function tryOpen(obj, label)
-        if type(obj) ~= "table" then return false end
-        for _, fn in ipairs(OPEN_FNS) do
-            local f = obj[fn]
-            if type(f) == "function" then
-                local ok1, err = pcall(f, obj, true)
-                log("Лаг: " .. label .. ":" .. fn .. " ->", ok1 and "ok" or tostring(err))
-                if ok1 then return true end
-            end
-        end
-        return false
-    end
-    local opened = tryOpen(menu, "menu") or tryOpen(mgr, "mgr")
-    log("Лаг: открытие через методы:", opened)
+    -- 1) открыть меню хранилища
+    local okO, errO = pcall(function() storageMenu:Open() end)
+    log("Лаг: открытие хранилища ->", okO and "ok" or tostring(errO))
+    task.wait(0.3)
 
-    -- запасной путь: найти в GUI кнопку фантомного беквипа и нажать её
-    local display = tostring(def.DisplayName or name):lower()
-    local pg = player:FindFirstChildOfClass("PlayerGui")
-    local clicked = 0
-    if pg and firesignal then
-        for _, d in ipairs(pg:GetDescendants()) do
-            if clicked >= 3 then break end
-            if d:IsA("TextButton") or d:IsA("ImageButton") then
-                local label = (d:IsA("TextButton") and d.Text or ""):lower()
-                if d.Name:lower() == display or label == display then
-                    log("Лаг: нашёл кнопку в GUI:", d:GetFullName())
-                    pcall(firesignal, d.MouseButton1Click)
-                    pcall(firesignal, d.Activated)
-                    clicked += 1
-                end
-            end
-        end
+    -- 2) открыть инспектор именно на фантоме (так делает клик по строке беквипа)
+    local inspector = storageMenu.BeequipInspector
+    if type(inspector) ~= "table" then
+        log("Лаг: инспектор не найден, поля меню:", keysOf(storageMenu))
+        return
     end
-    if clicked == 0 then log("Лаг: кнопка беквипа в GUI не найдена (меню хранилища не открыто?)") end
+    local okF, file = pcall(BeequipFile.FromData, raw)
+    if not okF or not file then file = raw end
+    log("Лаг: открываю инспектор фантома...") -- после этой строки клиент может зависнуть
+    local okI, errI = pcall(function()
+        inspector:SetBeequipFile(file)
+        inspector:Toggle()
+    end)
+    log("Лаг: инспектор ->", okI and "ok" or tostring(errI))
 end
 
 ----------------------------------------------------------------
