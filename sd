@@ -1,0 +1,1074 @@
+--[[
+    EggBuyer (конфиг-версия, без GUI)
+    Читает настройки из getgenv().Config (или _G.Config), которые задаются ПЕРЕД loadstring.
+    Всё, что не указано в конфиге, берётся из Defaults ниже: по умолчанию все false / 0 = ничего не делает.
+    Любую строку или целую секцию можно просто удалить - она будет пропущена.
+    Везде, где число, можно написать "all" (или "max") = использовать/купить всё, что есть на аккаунте.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local env = (getgenv and getgenv()) or _G
+
+-- фантомные беквипы (Lag): не должны попадать в дискард/экип
+local phantomSet = setmetatable({}, {__mode = "k"})
+
+----------------------------------------------------------------
+-- Конфиг по умолчанию
+----------------------------------------------------------------
+local Defaults = {
+    Log = false,        -- писать ход работы в консоль (print)
+    Loop = false,       -- повторять весь цикл бесконечно
+    LoopDelay = 0,      -- пауза между циклами в секундах (минимум 5, если Loop = true)
+
+    Lag = false,        -- создать фантомный беквип с оффсетом math.huge и открыть его (только клиент)
+    LagBeequip = "Kazoo", -- какой беквип использовать для Lag
+
+    Eviction = {
+        Buy = 0,                -- сколько евиктов купить (число)
+        Use = 0,                -- сколько юзнуть на пчёлах: число или "all" (УДАЛЯЕТ пчёл!)
+        AutoBuyMissing = false, -- докупать недостающие евикты перед использованием
+    },
+
+    Treats = {
+        Buy = 0,                -- сколько печенек купить: число или "max"
+    },
+
+    Tickets = {
+        Buy = 0,                -- сколько тикетов купить за мёд: число или "max"
+    },
+
+    DiscardStickers = {
+        Amount = 0,             -- сколько стикеров удалить: число или "all"
+        FromBook = false,       -- брать и из книги (иначе только инбокс)
+    },
+
+    EquipBeequips = {
+        Amount = 0,             -- сколько беквипов надеть на пчёл без беквипов: число или "all"
+        FromStorage = false,    -- брать и из хранилища (иначе только инбокс)
+        MaxRarity = "Common",   -- "Common" | "Rare" | "Epic" | "Legendary"
+    },
+
+    DiscardBeequips = {
+        Amount = 0,             -- сколько беквипов удалить: число или "all"
+        FromStorage = false,    -- брать и из хранилища (иначе только инбокс)
+        MaxRarity = "Common",   -- "Common" | "Rare" | "Epic" (удаляет до этой редкости включительно)
+        -- Если задан Wax.Times > 0: перед удалением беквип надевается на пчелу, ваксится
+        -- (при Wax.Turpentine и 5 вакса - сначала скипидар), снимается и только потом удаляется.
+    },
+
+    Wax = {
+        Type = "SoftWax",       -- SoftWax | HardWax | CausticWax | SwirledWax | Turpentine
+        Bees = 0,               -- на скольких пчёл с беквипами: число или "all"
+        Times = 0,              -- сколько раз на каждую пчелу
+        Turpentine = false,     -- если на беквипе уже 5 ваксов: сначала скипидар, потом воск
+    },
+
+    Blender = {
+        Enabled = false,        -- запускать авто-блендер
+        BuyTicketsUpTo = 0,     -- докупать за запуск до N тикетов за мёд (0 = не докупать)
+        AutoWax = false,        -- применять Soft/Hard Wax на беквипах после крафта
+        Repeat = false,         -- повторять, пока можно
+        MaxRounds = 20,         -- максимум кругов при Repeat
+        -- Приоритет рецептов: выше в списке = важнее. Остальные идут после, от дорогих к дешёвым.
+        Priority = {
+            "Turpentine",
+            "SwirledWax",
+            "SuperSmoothie",
+            "CausticWax",
+            "PurplePotion",
+        },
+    },
+}
+
+-- true / "true" / "yes" / "on" / "1" / 1 -> true, всё остальное -> false
+local function toBool(v)
+    if type(v) == "boolean" then return v end
+    if type(v) == "number" then return v ~= 0 end
+    if type(v) == "string" then
+        local s = (v:lower():gsub("%s+", ""))
+        return s == "true" or s == "yes" or s == "on" or s == "1" or s == "да"
+    end
+    return false
+end
+
+-- Глубокое слияние: словари сливаются, массивы (Priority) заменяются целиком.
+-- Пропущенные ключи берутся из defaults; у булевых полей значение приводится к true/false.
+local function merge(def, usr)
+    local out = {}
+    for k, v in pairs(def) do
+        local u = type(usr) == "table" and usr[k] or nil
+        if type(v) == "table" and #v == 0 then
+            out[k] = merge(v, u)
+        elseif u ~= nil then
+            if type(v) == "boolean" then out[k] = toBool(u) else out[k] = u end
+        else
+            out[k] = v
+        end
+    end
+    return out
+end
+
+local CFG = merge(Defaults, env.Config)
+
+local function log(...)
+    if CFG.Log then print("[EggBuyer]", ...) end
+end
+
+----------------------------------------------------------------
+-- Модули игры
+----------------------------------------------------------------
+local function tryRequire(f)
+    local ok, m = pcall(f)
+    return ok and m or nil
+end
+
+local Events = require(ReplicatedStorage.Events)
+local EggTypes = require(ReplicatedStorage.EggTypes)
+local ClientStatCache = require(ReplicatedStorage.ClientStatCache)
+
+local StickerFile = tryRequire(function() return require(ReplicatedStorage.Stickers.StickerFile) end)
+local BeequipFile = tryRequire(function() return require(ReplicatedStorage.Beequips.BeequipFile) end)
+local BeeStats = tryRequire(function() return require(ReplicatedStorage.BeeStats) end)
+local BlenderRecipes = tryRequire(function() return require(ReplicatedStorage.BlenderRecipes) end)
+local ClientStatTools = tryRequire(function() return require(ReplicatedStorage.ClientStatTools) end)
+local OsTime = tryRequire(function() return require(ReplicatedStorage.OsTime) end)
+local BeequipTypes = tryRequire(function() return require(ReplicatedStorage.Beequips.BeequipTypes) end)
+local WaxTypes = tryRequire(function() return require(ReplicatedStorage.WaxTypes) end)
+
+local player = Players.LocalPlayer
+local EGG = "Eviction"
+
+----------------------------------------------------------------
+-- Общие функции
+----------------------------------------------------------------
+local function fmt(n)
+    local str = string.format("%.0f", math.floor(n))
+    local out = str:reverse():gsub("(%d%d%d)", "%1 "):reverse()
+    return (out:gsub("^%s+", ""))
+end
+
+local function eggCountOf(key)
+    local stats = ClientStatCache:Get()
+    return (stats and stats.Eggs and stats.Eggs[key]) or 0
+end
+
+local function getHoney()
+    local stats = ClientStatCache:Get()
+    return (stats and stats.Honey) or 0
+end
+
+local function purchasesOf(key)
+    local stats = ClientStatCache:Get()
+    local t = stats and stats.Totals and stats.Totals.Purchases and stats.Totals.Purchases.Eggs
+    return (t and t[key]) or 0
+end
+
+-- ждать, пока fn() станет true (до timeout секунд)
+local function waitFor(fn, timeout)
+    local t0 = os.clock()
+    while not fn() and os.clock() - t0 < timeout do task.wait(0.1) end
+    return fn()
+end
+
+-- число / "all" / "max" -> число (0 если не задано или некорректно)
+local function toAmount(v, total)
+    if type(v) == "string" then
+        local s = (v:lower():gsub("%s+", ""))
+        if (s == "all" or s == "max" or s == "все") then
+            return total or 0
+        end
+        v = tonumber(s)
+    end
+    if type(v) ~= "number" or v <= 0 then return 0 end
+    v = math.floor(v)
+    if total then v = math.min(v, total) end
+    return v
+end
+
+-- Занятые слоты улья и число открытых слотов
+local function getHive()
+    local bees, unlocked = {}, 0
+    local hcValue = player:FindFirstChild("Honeycomb")
+    local hc = hcValue and hcValue.Value
+    if not hc then return bees, unlocked end
+
+    local data = ClientStatCache:Get("Honeycomb") or {}
+    for x = 1, 5 do
+        for y = 1, 10 do
+            local cell = hc.Cells:FindFirstChild("C" .. x .. "," .. y)
+            if cell then
+                local lockedVal = cell:FindFirstChild("CellLocked")
+                if not (lockedVal and lockedVal.Value) then
+                    unlocked += 1
+                    local col = data["x" .. x]
+                    if col and col["y" .. y] then
+                        table.insert(bees, {x = x, y = y})
+                    end
+                end
+            end
+        end
+    end
+    return bees, unlocked
+end
+
+-- Применить яйцо/воск на ячейку. true при успехе
+local function useEggAt(x, y, eggType)
+    local ok, eggs, success, honeycomb, discovered, uses = pcall(function()
+        return Events.ClientCall("ConstructHiveCellFromEgg", x, y, eggType, 1, false, nil)
+    end)
+    if not ok or not success then return false end
+
+    pcall(function()
+        ClientStatCache:Set({"Eggs", eggType}, eggs)
+        ClientStatCache:Set("DiscoveredBees", discovered)
+        ClientStatCache:Set("Honeycomb", honeycomb)
+        ClientStatCache:Set({"Totals", "EggUses"}, uses)
+    end)
+    return true
+end
+
+local function beeFileAt(x, y)
+    local data = ClientStatCache:Get("Honeycomb")
+    local col = data and data["x" .. x]
+    return col and col["y" .. y]
+end
+
+local function hasBeequip(x, y)
+    if not BeeStats then return false end
+    local file = beeFileAt(x, y)
+    if not file then return false end
+    local ok, bq = pcall(BeeStats.GetBeequip, file)
+    return ok and bq ~= nil
+end
+
+local function getBeesWithBeequips()
+    local out = {}
+    for _, b in ipairs((getHive())) do
+        if hasBeequip(b.x, b.y) then table.insert(out, b) end
+    end
+    return out
+end
+
+----------------------------------------------------------------
+-- Евикты
+----------------------------------------------------------------
+local function purchaseEviction(amount)
+    EggTypes.Get(EGG).Hidden = false
+    Events.ClientCall("ItemPackageEvent", "Purchase", {
+        Category = "Eggs", Type = EGG, Amount = amount,
+    })
+end
+
+-- купить максимум, на что хватает мёда: пачками по убыванию, пока покупка проходит
+local function buyAllEvictions()
+    local total = 0
+    for _, step in ipairs({100000, 10000, 1000, 100, 10, 1}) do
+        while true do
+            local before = eggCountOf(EGG)
+            local ok = pcall(purchaseEviction, step)
+            if not ok then break end
+            waitFor(function() return eggCountOf(EGG) > before end, 2)
+            local got = eggCountOf(EGG) - before
+            if got <= 0 then break end
+            total += got
+        end
+    end
+    return total
+end
+
+local function isAllWord(v)
+    return type(v) == "string" and (({all = true, max = true, ["все"] = true})[(v:lower():gsub("%s+", ""))] or false)
+end
+
+local function doEvictionBuy(c)
+    if isAllWord(c.Eviction.Buy) then
+        log("Евикты: куплено (всё на мёд)", buyAllEvictions())
+        return
+    end
+    local n = toAmount(c.Eviction.Buy)
+    if n <= 0 then return end
+    local before = eggCountOf(EGG)
+    local ok, e = pcall(purchaseEviction, n)
+    if not ok then log("Евикты: ошибка покупки:", e) return end
+    waitFor(function() return eggCountOf(EGG) > before end, 4)
+    log("Евикты: куплено", eggCountOf(EGG) - before)
+end
+
+local function doEvictionUse(c)
+    local bees = getHive()
+    local amount = toAmount(c.Eviction.Use, #bees)
+    if amount <= 0 then return end
+
+    local owned = eggCountOf(EGG)
+    if owned < amount and c.Eviction.AutoBuyMissing then
+        pcall(purchaseEviction, amount - owned)
+        waitFor(function() return eggCountOf(EGG) >= amount end, 4)
+        owned = eggCountOf(EGG)
+    end
+    amount = math.min(amount, owned)
+    if amount <= 0 then log("Евикты: нет евиктов для использования") return end
+
+    local done = 0
+    for i = 1, amount do
+        local slot = bees[i]
+        if not useEggAt(slot.x, slot.y, EGG) then
+            log(string.format("Евикты: остановлено на %d/%d", done, amount))
+            return
+        end
+        done += 1
+        task.wait(0.2)
+    end
+    log("Евикты: использовано", done)
+end
+
+----------------------------------------------------------------
+-- Печеньки
+----------------------------------------------------------------
+-- цена одной печеньки: 100 + 100 * (уже куплено), максимум 10000
+local function treatPrice(bought)
+    return math.min(100 + 100 * bought, 10000)
+end
+
+local function maxTreats(honey, bought)
+    local total, k = 0, 0
+    while true do
+        local c = treatPrice(bought + k)
+        if total + c > honey then return k end
+        total += c
+        k += 1
+        if c >= 10000 then
+            return k + math.floor((honey - total) / 10000)
+        end
+    end
+end
+
+local function doTreats(c)
+    local cap = maxTreats(getHoney(), purchasesOf("Treat"))
+    local n = toAmount(c.Treats.Buy, cap)
+    if n <= 0 then
+        if toAmount(c.Treats.Buy, math.huge) > 0 then log("Печеньки: не хватает мёда") end
+        return
+    end
+    local before = eggCountOf("Treat")
+    local ok, e = pcall(function()
+        Events.ClientCall("ItemPackageEvent", "Purchase", {
+            Category = "Eggs", Type = "Treat", Amount = n,
+        })
+    end)
+    if not ok then log("Печеньки: ошибка:", e) return end
+    waitFor(function() return eggCountOf("Treat") > before end, 3)
+    log("Печеньки: куплено", eggCountOf("Treat") - before)
+end
+
+----------------------------------------------------------------
+-- Тикеты
+----------------------------------------------------------------
+local TICKET_LIMIT = 100000
+
+local function ticketPrice(k)
+    if k > 50000 then
+        return math.floor((k - 50000) ^ 1.85) * 10000000 + 100000000000
+    end
+    return math.floor((k - 1) ^ (k < 500 and 1.2 or 1.7)) * 1000 + 100000
+end
+
+local function getTickets() return eggCountOf("Ticket") end
+local function getTicketPurchases() return purchasesOf("Ticket") end
+
+-- сколько тикетов (не больше want) можно купить на мёд
+local function affordableTickets(honey, bought, want)
+    local total, count = 0, 0
+    while count < want and bought + count < TICKET_LIMIT do
+        local price = ticketPrice(1 + bought + count)
+        if total + price > honey then break end
+        total += price
+        count += 1
+    end
+    return count, total
+end
+
+local function buyTickets(n)
+    local before = getTickets()
+    local ok, e = pcall(function()
+        Events.ClientCall("ItemPackageEvent", "Purchase", {
+            Category = "Eggs", Type = "Ticket", Amount = n,
+        })
+    end)
+    if not ok then return false, tostring(e) end
+    return waitFor(function() return getTickets() > before end, 3)
+end
+
+local function doTickets(c)
+    local bought = getTicketPurchases()
+    local cap = affordableTickets(getHoney(), bought, TICKET_LIMIT - bought)
+    local n = toAmount(c.Tickets.Buy, cap)
+    if n <= 0 then
+        if toAmount(c.Tickets.Buy, math.huge) > 0 then log("Тикеты: не хватает мёда") end
+        return
+    end
+    local ok = buyTickets(n)
+    log(ok and ("Тикеты: теперь " .. fmt(getTickets())) or "Тикеты: покупка не прошла")
+end
+
+----------------------------------------------------------------
+-- Хелперы беквипов: экип / воск / скипидар
+----------------------------------------------------------------
+local MAX_WAXES = (BeequipFile and BeequipFile.MAX_WAXES) or 5
+local VALID_WAX = {SoftWax = true, HardWax = true, CausticWax = true, SwirledWax = true, Turpentine = true}
+local WAX_BY_LOWER = {}
+for k in pairs(VALID_WAX) do WAX_BY_LOWER[k:lower()] = k end
+
+-- сколько ваксов уже на беквипе пчелы в слоте x,y
+local function waxCountAt(x, y)
+    if not BeeStats then return 0 end
+    local file = beeFileAt(x, y)
+    if not file then return 0 end
+    local ok, bq = pcall(BeeStats.GetBeequip, file)
+    if not ok or not bq then return 0 end
+    local ok2, h = pcall(function() return bq:GetWaxHistory() end)
+    if ok2 and type(h) == "table" then return #h end
+    return type(bq.W) == "table" and #bq.W or 0
+end
+
+-- Вакс на пчеле: если ваксов уже MAX и включён useTurp - сначала скипидар.
+-- Возвращает сколько ваксов реально применено.
+local function waxBee(x, y, key, times, useTurp)
+    local used = 0
+    if useTurp and key ~= "Turpentine" and waxCountAt(x, y) >= MAX_WAXES then
+        if eggCountOf("Turpentine") > 0 and useEggAt(x, y, "Turpentine") then
+            task.wait(0.25)
+        else
+            return 0
+        end
+    end
+    for _ = 1, times do
+        if eggCountOf(key) <= 0 then break end
+        if not hasBeequip(x, y) then break end -- беквип пропал (например, сломался)
+        if key ~= "Turpentine" and waxCountAt(x, y) >= MAX_WAXES then break end
+        if useEggAt(x, y, key) then
+            used += 1
+        else
+            break
+        end
+        task.wait(0.25)
+    end
+    return used
+end
+
+-- пчёлы без беквипа
+local function freeBeeSlots()
+    local out = {}
+    for _, b in ipairs((getHive())) do
+        if not hasBeequip(b.x, b.y) then table.insert(out, b) end
+    end
+    return out
+end
+
+local function beequipCall(action, file, extra)
+    local data = {BeequipIDs = file.IDs}
+    if extra then for k, v in pairs(extra) do data[k] = v end end
+    local ok, res = pcall(Events.ClientCall, "BeequipEvent", action, data)
+    return ok and res ~= false
+end
+
+-- надеть беквип на пчелу (сначала в кейс, потом Equip с координатами слота)
+local function equipFile(file, slot)
+    beequipCall("MoveToCase", file) -- если уже в кейсе - ошибка не страшна
+    task.wait(0.2)
+    beequipCall("Equip", file, {X = slot.x, Y = slot.y})
+    return waitFor(function() return hasBeequip(slot.x, slot.y) end, 3)
+end
+
+local function unequipFile(file, slot)
+    beequipCall("Unequip", file)
+    return waitFor(function() return not hasBeequip(slot.x, slot.y) end, 3)
+end
+
+----------------------------------------------------------------
+-- Дискард стикеров / беквипов
+----------------------------------------------------------------
+local RARITY_ORDER = {Common = 1, Rare = 2, Epic = 3, Legendary = 4}
+
+-- "Common"/"Rare"/... (без учёта регистра) -> номер; "all" -> allValue
+local function rarityOf(v, allValue)
+    local s = (tostring(v or ""):lower():gsub("%s+", ""))
+    if s == "all" then return allValue end
+    for name, n in pairs(RARITY_ORDER) do
+        if name:lower() == s then return n end
+    end
+    return 1
+end
+
+local function collectStickers(fromBook)
+    local out = {}
+    if not StickerFile then return out end
+    local stats = ClientStatCache:Get()
+    local data = stats and stats.Stickers
+    if not data then return out end
+
+    local function add(list)
+        for _, v in ipairs(list or {}) do
+            local ok, file = pcall(StickerFile.FromData, v)
+            if ok and file then
+                local ok2, good = pcall(function()
+                    local def = file:GetTypeDef()
+                    return def and not def.System and file:GetCosmeticType() == "Sticker"
+                end)
+                if ok2 and good then table.insert(out, file) end
+            end
+        end
+    end
+    add(data.Inbox)
+    if fromBook then add(data.Book) end
+    return out
+end
+
+local function collectBeequips(fromStorage, rarityLimit, includePermanent)
+    local out = {}
+    if not BeequipFile then return out end
+    local stats = ClientStatCache:Get()
+    local data = stats and stats.Beequips
+    if not data then return out end
+
+    local function add(list)
+        for _, v in ipairs(list or {}) do
+            local ok, file = pcall(BeequipFile.FromData, v)
+            if ok and file and not phantomSet[v] then
+                local ok2, good = pcall(function()
+                    local def = file:GetTypeDef()
+                    if not def or (def.Permanent and not includePermanent) then return false end
+                    local r = RARITY_ORDER[def.Rarity or "Common"] or 99
+                    return r <= rarityLimit
+                end)
+                if ok2 and good then table.insert(out, file) end
+            end
+        end
+    end
+    add(data.Inbox)
+    if fromStorage then add(data.Storage) end
+    return out
+end
+
+local function discardLoop(items, amount, exec, what)
+    local done = 0
+    for i = 1, amount do
+        if not exec(items[i]) then
+            log(string.format("%s: остановлено на %d/%d", what, done, amount))
+            return
+        end
+        done += 1
+        task.wait(0.15)
+    end
+    log(what .. ": удалено", done)
+end
+
+local function doDiscardStickers(c)
+    if toAmount(c.DiscardStickers.Amount, math.huge) <= 0 then return end
+    local items = collectStickers(c.DiscardStickers.FromBook)
+    local amount = toAmount(c.DiscardStickers.Amount, #items)
+    if amount <= 0 then log("Стикеры: нечего удалять") return end
+    discardLoop(items, amount, function(file)
+        local ok, res = pcall(Events.ClientCall, "StickerDiscard", file, false)
+        return ok and res ~= false
+    end, "Стикеры")
+end
+
+local function doDiscardBeequips(c)
+    if toAmount(c.DiscardBeequips.Amount, math.huge) <= 0 then return end
+    local limit = math.min(rarityOf(c.DiscardBeequips.MaxRarity, 3), 3) -- Legendary никогда не удаляем
+    local items = collectBeequips(c.DiscardBeequips.FromStorage, limit)
+    local amount = toAmount(c.DiscardBeequips.Amount, #items)
+    if amount <= 0 then log("Беквипы: нечего удалять") return end
+
+    local key = c.Wax.Type
+    local times = toAmount(c.Wax.Times, 999)
+
+    -- без вакса: обычное удаление
+    if times <= 0 or not VALID_WAX[key] then
+        discardLoop(items, amount, function(file)
+            local ok, res = pcall(Events.ClientCall, "BeequipEvent", "Discard", {BeequipIDs = file.IDs})
+            return ok and res ~= false
+        end, "Беквипы")
+        return
+    end
+
+    -- с ваксом: надеть -> (скипидар) -> вакс -> снять -> удалить
+    local slots = freeBeeSlots()
+    if #slots == 0 then log("Беквипы: нет свободной пчёлы (без беквипа) для вакса перед удалением") return end
+    local slot = slots[1]
+    local done, waxUsed = 0, 0
+
+    for i = 1, amount do
+        local file = items[i]
+        if not equipFile(file, slot) then
+            log(string.format("Беквипы: не удалось надеть %d/%d, остановлено", i, amount))
+            break
+        end
+
+        waxUsed += waxBee(slot.x, slot.y, key, times, c.Wax.Turpentine)
+
+        if hasBeequip(slot.x, slot.y) then
+            if not unequipFile(file, slot) then
+                log("Беквипы: не удалось снять, остановлено")
+                break
+            end
+            local ok = beequipCall("Discard", file)
+            if not ok then
+                beequipCall("Store", file) -- запасной путь: в хранилище, потом удалить
+                ok = beequipCall("Discard", file)
+            end
+            if not ok then
+                log("Беквипы: не удалось удалить, остановлено")
+                break
+            end
+        end -- иначе беквип сломался воском сам
+        done += 1
+        task.wait(0.15)
+    end
+    log(string.format("Беквипы: обработано %d (ваксов применено %d)", done, waxUsed))
+end
+
+local function doEquipBeequips(c)
+    local e = c.EquipBeequips
+    if toAmount(e.Amount, math.huge) <= 0 then return end
+    local limit = rarityOf(e.MaxRarity, 4)
+    local items = collectBeequips(e.FromStorage, limit, true)
+    local slots = freeBeeSlots()
+    local amount = toAmount(e.Amount, math.min(#items, #slots))
+    if amount <= 0 then log("Экип: нет беквипов или свободных пчёл") return end
+
+    local done = 0
+    for i = 1, amount do
+        if equipFile(items[i], slots[i]) then
+            done += 1
+        else
+            log(string.format("Экип: не удалось надеть на слот %d,%d", slots[i].x, slots[i].y))
+        end
+        task.wait(0.2)
+    end
+    log("Экип: надето", done)
+end
+
+----------------------------------------------------------------
+-- Воски / скипидар
+----------------------------------------------------------------
+local function doWax(c)
+    local key = c.Wax.Type
+    if not VALID_WAX[key] then log("Воск: неизвестный тип", tostring(key)) return end
+
+    local list = getBeesWithBeequips()
+    local nBees = toAmount(c.Wax.Bees, #list)
+    local times = toAmount(c.Wax.Times, 999)
+    if nBees <= 0 or times <= 0 then return end
+    if eggCountOf(key) <= 0 then log("Воск: нет предмета", key) return end
+
+    local used = 0
+    for i = 1, nBees do
+        if eggCountOf(key) <= 0 then break end
+        used += waxBee(list[i].x, list[i].y, key, times, c.Wax.Turpentine)
+    end
+    log(string.format("Воск %s: использовано %d", key, used))
+end
+
+----------------------------------------------------------------
+-- Блендер
+----------------------------------------------------------------
+local RECIPE_NAMES = {
+    "RedExtract", "BlueExtract", "Enzymes", "Oil", "Glue", "TropicalDrink", "Gumdrops",
+    "MoonCharm", "Glitter", "StarJelly", "PurplePotion", "SoftWax", "HardWax", "SwirledWax",
+    "CausticWax", "FieldDice", "SmoothDice", "LoadedDice", "SuperSmoothie", "Turpentine",
+}
+local AUTO_WAX = {SoftWax = true, HardWax = true} -- безопасно применять автоматически
+local MAX_DEPTH = 6
+
+local valueCache = {}
+local function recipeValue(name)
+    if valueCache[name] ~= nil then return valueCache[name] end
+    valueCache[name] = 0
+    local r = BlenderRecipes.Get(name)
+    local v = 0
+    if r then
+        for _, ing in ipairs(r.Ingredients) do
+            local unit = BlenderRecipes.Get(ing.Type) and recipeValue(ing.Type) or 1
+            v += ing.Amount * unit
+        end
+    end
+    valueCache[name] = v
+    return v
+end
+
+local function reqsMet(r)
+    if not r.Requirements or #r.Requirements == 0 then return true end
+    if not ClientStatTools then return true end
+    local ok, res = pcall(ClientStatTools.CheckReqs, r.Requirements)
+    if ok then return res and true or false end
+    return true -- не смогли проверить: решит сервер
+end
+
+-- Раскрывает рецепт: списывает ингредиенты из inv, недостающие докрафчивает.
+-- steps получает шаги в порядке выполнения. Возвращает число тикетов или nil.
+local function expand(name, count, inv, steps, depth)
+    if depth > MAX_DEPTH then return nil end
+    local r = BlenderRecipes.Get(name)
+    if not r or not reqsMet(r) then return nil end
+
+    local tickets = 0
+    for _, ing in ipairs(r.Ingredients) do
+        local need = ing.Amount * count
+        local have = inv[ing.Type] or 0
+        if have >= need then
+            inv[ing.Type] = have - need
+        else
+            local short = need - have
+            inv[ing.Type] = 0
+            if not BlenderRecipes.Get(ing.Type) then return nil end -- базовый ресурс
+            local t = expand(ing.Type, short, inv, steps, depth + 1)
+            if not t then return nil end
+            tickets += t
+        end
+    end
+
+    local per = r.AutoCompletePerTicket or 1
+    table.insert(steps, {name = name, count = count})
+    return tickets + math.ceil(count / per)
+end
+
+local function tryBuild(eggs, name, n)
+    local inv = {}
+    for k, v in pairs(eggs) do inv[k] = v end
+    local steps = {}
+    local t = expand(name, n, inv, steps, 0)
+    return t, steps
+end
+
+-- максимум штук рецепта, укладывающийся в ресурсы и в avail тикетов
+local function bestCount(eggs, name, avail)
+    local function ok(n)
+        local t = tryBuild(eggs, name, n)
+        return t ~= nil and t <= avail
+    end
+    if not ok(1) then return 0 end
+    local lo, hi = 1, 2
+    while ok(hi) do
+        lo = hi
+        hi = hi * 2
+        if hi > 1e8 then return lo end
+    end
+    while hi - lo > 1 do
+        local mid = math.floor((lo + hi) / 2)
+        if ok(mid) then lo = mid else hi = mid end
+    end
+    return lo
+end
+
+local function makePlan(buyCap, priority)
+    local stats = ClientStatCache:Get()
+    if not stats then return nil, "Нет данных" end
+    local eggs = stats.Eggs or {}
+    local tickets = eggs.Ticket or 0
+    local honey = stats.Honey or 0
+    local bought = getTicketPurchases()
+    buyCap = math.max(0, buyCap or 0)
+
+    local rank = {}
+    for i, n in ipairs(priority) do rank[n] = i end
+
+    local buyable = buyCap > 0 and affordableTickets(honey, bought, buyCap) or 0
+    local avail = tickets + buyable
+
+    local names = {}
+    for _, name in ipairs(RECIPE_NAMES) do
+        local r = BlenderRecipes.Get(name)
+        if r and reqsMet(r) then table.insert(names, name) end
+    end
+    table.sort(names, function(a, b)
+        local ra, rb = rank[a] or 100, rank[b] or 100
+        if ra ~= rb then return ra < rb end
+        return recipeValue(a) > recipeValue(b)
+    end)
+
+    for _, name in ipairs(names) do
+        local n = bestCount(eggs, name, avail)
+        if n >= 1 then
+            local need, steps = tryBuild(eggs, name, n)
+            return {
+                name = name, count = n, steps = steps,
+                need = need, buy = math.max(0, need - tickets),
+            }
+        end
+    end
+
+    for _, name in ipairs(names) do
+        if bestCount(eggs, name, math.huge) >= 1 then
+            return nil, "Не хватает тикетов (и докупить нельзя)"
+        end
+    end
+    return nil, "Не хватает ресурсов ни на один рецепт"
+end
+
+-- сколько тикетов нужно, чтобы ускорить текущий заказ
+local function orderTicketsNeeded(st)
+    local r = BlenderRecipes.Get(st.Recipe)
+    if not r then return 0 end
+    local playtime = ClientStatCache:Get("PlaytimeAtLoad")
+    local loadTime = ClientStatCache:Get("LoadTime")
+    if not playtime or not loadTime or not OsTime then return nil end
+    local offline = ClientStatCache:Get("OfflineProgressTime") or 0
+    local elapsed = playtime + (OsTime() - loadTime) + offline - st.StartTime
+    local count = st.Count
+    local progress = math.clamp(elapsed / (count * r.Time), 0, 1)
+    local per = r.AutoCompletePerTicket or 1
+    local done = math.floor(math.floor(progress * count) / per)
+    return math.ceil((count - done * per) / per)
+end
+
+-- ускорить тикетами и забрать
+local function finishOrder(st)
+    local need = orderTicketsNeeded(st)
+    if need == nil then return false, "нет данных о времени заказа" end
+    if need > 0 then
+        if getTickets() < need then
+            return false, "на текущий заказ не хватает тикетов (нужно " .. need .. ")"
+        end
+        local ok, e = pcall(Events.ClientCall, "BlenderCommand", "SpeedUpOrder")
+        if not ok then return false, tostring(e) end
+        task.wait(0.5)
+    end
+    pcall(Events.ClientCall, "BlenderCommand", "StopOrder")
+    pcall(function() ClientStatCache:Set("BlenderState", nil) end)
+    return true
+end
+
+-- один заказ в блендере
+local function runStep(name, count)
+    local before = eggCountOf(name)
+    log(string.format("Блендер: заказ %s x%s", name, fmt(count)))
+    local ok, state = pcall(Events.ClientCall, "BlenderCommand", "PlaceOrder", {
+        Recipe = name, Count = count,
+    })
+    if not ok or not state then
+        return false, "блендер отклонил заказ " .. name .. " (проверь, что ты рядом с ним)"
+    end
+    pcall(function() ClientStatCache:Set("BlenderState", state) end)
+    task.wait(0.5)
+
+    local st = ClientStatCache:Get("BlenderState")
+    if st then
+        local ok2, msg = finishOrder(st)
+        if not ok2 then return false, msg end
+    end
+
+    waitFor(function() return eggCountOf(name) > before end, 4)
+    local got = eggCountOf(name) - before
+    if got <= 0 then return false, "предметы не пришли: " .. name end
+    return true, got
+end
+
+-- весь план: докупка тикетов, докрафт ингредиентов, затем сам рецепт
+local function runPlan(plan)
+    if plan.buy > 0 then
+        log("Блендер: докупаю тикеты x" .. fmt(plan.buy))
+        if not buyTickets(plan.buy) then return false, "не удалось купить тикеты" end
+    end
+    local got = 0
+    for i, s in ipairs(plan.steps) do
+        local ok, res = runStep(s.name, s.count)
+        if not ok then return false, res end
+        if i == #plan.steps then got = res end
+    end
+    return true, got
+end
+
+-- Применить воск по кругу на все беквипы, пока не кончится
+local function autoUseWax(key)
+    local bees = getBeesWithBeequips()
+    local used, dead = 0, {}
+    local progress = true
+    while progress and eggCountOf(key) > 0 do
+        progress = false
+        for _, bee in ipairs(bees) do
+            if eggCountOf(key) <= 0 then break end
+            local id = bee.x .. "," .. bee.y
+            if not dead[id] and hasBeequip(bee.x, bee.y) then
+                if useEggAt(bee.x, bee.y, key) then
+                    used += 1
+                    progress = true
+                    task.wait(0.25)
+                else
+                    dead[id] = true
+                end
+            end
+        end
+    end
+    return used
+end
+
+local function doBlender(c)
+    local b = c.Blender
+    if not b.Enabled then return end
+    if not BlenderRecipes then log("Блендер: модуль BlenderRecipes не найден") return end
+
+    local cap = toAmount(b.BuyTicketsUpTo, TICKET_LIMIT)
+    local maxRounds = math.max(1, toAmount(b.MaxRounds, 1000))
+    local rounds, boughtTotal = 0, 0
+
+    repeat
+        rounds += 1
+
+        local st = ClientStatCache:Get("BlenderState")
+        if st then
+            local ok, msg = finishOrder(st)
+            if not ok then log("Блендер: ❌", msg) return end
+        end
+
+        local plan, err = makePlan(cap - boughtTotal, b.Priority)
+        if not plan then
+            log(rounds == 1 and ("Блендер: ❌ " .. tostring(err)) or ("Блендер: готово — " .. tostring(err)))
+            return
+        end
+
+        local ok, res = runPlan(plan)
+        if not ok then log("Блендер: ❌", res) return end
+        boughtTotal += plan.buy
+
+        local msg = string.format("Блендер: ✓ %s x%s", plan.name, fmt(res))
+        if b.AutoWax and AUTO_WAX[plan.name] then
+            msg ..= string.format(" • воск применён: %d", autoUseWax(plan.name))
+        end
+        log(msg)
+        task.wait(0.5)
+    until not b.Repeat or rounds >= maxRounds
+end
+
+----------------------------------------------------------------
+-- Lag: фантомный беквип с оффсетом math.huge (только на клиенте, сервер не трогаем)
+----------------------------------------------------------------
+-- если скрипт перезапущен - снимаем наш старый хук
+if env.__EggBuyerOldGet then
+    pcall(function() ClientStatCache.Get = env.__EggBuyerOldGet end)
+    env.__EggBuyerOldGet = nil
+end
+
+local lagPhantoms = {}
+local lagCount = 0
+
+local function installPhantomHook()
+    if env.__EggBuyerOldGet then return end
+    local old = ClientStatCache.Get
+    env.__EggBuyerOldGet = old
+    ClientStatCache.Get = function(...)
+        local stats = old(...)
+        -- подмешиваем только в полный объект статов (без path)
+        local hasPath = select("#", ...) >= 2 and (select(2, ...)) ~= nil
+        if not hasPath and #lagPhantoms > 0 then
+            pcall(function()
+                local bq = stats and stats.Beequips
+                local storage = bq and bq.Storage
+                if type(storage) ~= "table" then return end
+                if storage[#storage] ~= lagPhantoms[#lagPhantoms] then
+                    for _, ph in ipairs(lagPhantoms) do
+                        local present = false
+                        for _, v in ipairs(storage) do
+                            if v == ph then present = true break end
+                        end
+                        if not present then table.insert(storage, ph) end
+                    end
+                end
+                if type(bq.StorageSize) ~= "number" or bq.StorageSize < #storage then
+                    bq.StorageSize = #storage
+                end
+            end)
+        end
+        return stats
+    end
+end
+
+local function doLag(c)
+    if not c.Lag then return end
+    if not (BeequipFile and BeequipTypes and WaxTypes) then log("Лаг: не найдены модули беквипов/воска") return end
+
+    local name = tostring(c.LagBeequip or "Kazoo")
+    local def = BeequipTypes.Get(name)
+    if not def then log("Лаг: неизвестный беквип", name) return end
+
+    local waxId = 1
+    for id, data in pairs(WaxTypes.TypeByID) do
+        if string.find(string.lower(tostring(data.Name or "")), "hard", 1, true) then waxId = id break end
+    end
+
+    lagCount += 1
+    local rng = Random.new()
+    local raw = {
+        T = name, Q = 1, S = rng:NextInteger(1, 2199023255551),
+        IDs = {player.UserId, 700000 + lagCount, rng:NextInteger(1, 9007199254740991), os.time()},
+        UC = 0, RC = 0, TC = 0,
+        W = {{waxId, true, math.huge}}, -- оффсет math.huge
+    }
+    setmetatable(raw, BeequipFile)
+    raw.GetTypeDef = function() return def end
+    raw.GenerateModifiers = function()
+        local ok, m, h, a = pcall(BeequipFile.GenerateModifiers, raw)
+        if ok then return m, h, a end
+        return {}, {}, {}
+    end
+
+    phantomSet[raw] = true
+    table.insert(lagPhantoms, raw)
+    installPhantomHook()
+    log("Лаг: фантомный беквип создан в хранилище")
+
+    -- обновить меню и попытаться открыть хранилище (названия методов - предположение)
+    pcall(function()
+        local mgr = require(ReplicatedStorage.Gui.BeequipMenus.BeequipMenuManager)
+        mgr.UpdateAll()
+        local menu = mgr.GetByName and mgr.GetByName("Storage")
+        if menu then
+            for _, fn in ipairs({"Open", "Show", "Toggle"}) do
+                if type(menu[fn]) == "function" then
+                    pcall(menu[fn], menu)
+                    break
+                end
+            end
+        end
+    end)
+end
+
+----------------------------------------------------------------
+-- Запуск
+----------------------------------------------------------------
+local function runOnce()
+    CFG = merge(Defaults, env.Config) -- перечитываем конфиг каждый цикл
+    CFG.Wax.Type = WAX_BY_LOWER[tostring(CFG.Wax.Type):lower()] or CFG.Wax.Type -- регистр не важен
+    local steps = {
+        {"Treats", doTreats},
+        {"Tickets", doTickets},
+        {"EvictionBuy", doEvictionBuy},
+        {"EvictionUse", doEvictionUse},
+        {"DiscardStickers", doDiscardStickers},
+        {"EquipBeequips", doEquipBeequips},
+        {"Wax", doWax},
+        {"DiscardBeequips", doDiscardBeequips},
+        {"Blender", doBlender},
+        {"Lag", doLag}, -- всегда последним: может подвесить клиент
+    }
+    for _, s in ipairs(steps) do
+        local ok, err = pcall(s[2], CFG)
+        if not ok then log("Ошибка в " .. s[1] .. ":", tostring(err)) end
+    end
+end
+
+-- повторный запуск скрипта останавливает предыдущий цикл
+local token = {}
+env.__EggBuyerToken = token
+
+task.spawn(function()
+    runOnce()
+    while CFG.Loop and env.__EggBuyerToken == token do
+        task.wait(math.max(5, tonumber(CFG.LoopDelay) or 0))
+        if env.__EggBuyerToken ~= token then break end
+        runOnce()
+    end
+    log("Готово")
+end)
